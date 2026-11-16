@@ -27,6 +27,13 @@ bool SaveCompressed(const std::string& path, const std::vector<CompressedGame>& 
 //  - atmosphere/kip_patches/fs_patches with .ips files (Atmosphère);
 //  - sys-patch, the system module that patches as the console runs (contents/420000000000000B);
 //  - FS patches in bootloader/patches.ini (Hekate's fss0).
+//  - Embedded FS patch code in the Mesosphere/fusee segments of Atmosphère package3
+// Note: Detection indicates the presence of patch files or code, not actual patch activation.
+enum class EmbeddedFsPatchType { None, Mesosphere, Fusee };
+// Searches for compiled FS patch byte patterns in the Mesosphere/fusee segments of package3.
+// Does not compare whole-file hashes or access the memory of the running FS process.
+EmbeddedFsPatchType DetectEmbeddedFsPatches(const std::string& sd);
+
 struct Sigpatches {
     bool found = false;
     std::string how; // which of them, for the screen

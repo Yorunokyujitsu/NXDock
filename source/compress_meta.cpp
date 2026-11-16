@@ -5,10 +5,14 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
+#include <algorithm>
+#include <array>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace nxdock {
 namespace {
@@ -41,7 +45,71 @@ int CountIps(const std::string& dir) {
     return n;
 }
 
+// Detects embedded patch code in package3 without hashes, privileged syscalls, or Atmosphère modifications.
+uint32_t ReadLe32(const unsigned char *p) {
+    return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+}
+
+// Limit the amount of data read from an untrusted or corrupt SD file.
+constexpr size_t MaxSegmentSize = 2 * 1024 * 1024;
+
+template <size_t N>
+bool Contains(const std::vector<unsigned char> &bytes, const std::array<unsigned char, N> &pattern) {
+    return std::search(bytes.begin(), bytes.end(), pattern.begin(), pattern.end()) != bytes.end();
+}
+
+// Mesosphere uses kernel pattern matching to locate FS patch targets.
+// Detects two patterns from g_fs_narrow_patterns (u16, wildcard = 0x0100, little-endian).
+constexpr std::array<unsigned char, 20> nocntchk = {
+    0x06,0x00,0x94,0x00,0x00,0x01,0x00,0x01,0x00,0x00,
+    0x00,0x01,0x42,0x00,0x00,0x01,0x00,0x00,0x91,0x00
+};
+constexpr std::array<unsigned char, 24> noncasigchk = {
+    0x40,0x00,0xF9,0x00,0x00,0x01,0x00,0x01,0x00,0x01,
+    0x00,0x01,0x00,0x01,0x00,0x01,0x40,0x00,
+    0xB9,0x00,0x09,0x00,0x1C,0x00
+};
+
+// Fusee bypasses NCA header signature checks using mov w0, wzr and nop.
+// Detects these adjacent instructions without relying on firmware-specific offsets.
+constexpr std::array<unsigned char, 8> fuseePatch = {
+    0xE0, 0x03, 0x1F, 0x2A, // mov w0, wzr
+    0x1F, 0x20, 0x03, 0xD5  // nop
+};
+
 } // namespace
+
+EmbeddedFsPatchType DetectEmbeddedFsPatches(const std::string &sd) {
+    FILE *f = std::fopen((sd + "/atmosphere/package3").c_str(), "rb");
+    if (!f) return EmbeddedFsPatchType::None;
+
+    std::array<unsigned char, 0x240> hdr{};
+    EmbeddedFsPatchType result = EmbeddedFsPatchType::None;
+    if (std::fread(hdr.data(), 1, hdr.size(), f) == hdr.size() && std::memcmp(hdr.data(), "PK31", 4) == 0 && std::memcmp(hdr.data() + 0x20, "FSS0", 4) == 0) {
+        std::vector<unsigned char> bytes;
+        // FSS0 entries start at 0x40, each containing offset, size, type, reserved, and name fields.
+        for (size_t i = 0; i < 14; ++i) {
+            const unsigned char *entry = hdr.data() + 0x40 + i * 0x20;
+            const bool mesosphere = std::memcmp(entry + 16, "mesosphere", 11) == 0;
+            const bool fusee = std::memcmp(entry + 16, "fusee", 6) == 0;
+            if (!mesosphere && !fusee) continue;
+
+            const uint32_t offset = ReadLe32(entry);
+            const uint32_t length = ReadLe32(entry + 4);
+            if (!length || length > MaxSegmentSize || offset < hdr.size() || offset > 0x800000u || length > 0x800000u - offset) continue;
+            bytes.resize(length);
+            if (std::fseek(f, static_cast<long>(offset), SEEK_SET) != 0 || std::fread(bytes.data(), 1, length, f) != length) continue;
+
+            if (mesosphere && Contains(bytes, nocntchk) && Contains(bytes, noncasigchk)) {
+                result = EmbeddedFsPatchType::Mesosphere;
+                break; // Mesosphere takes priority if both implementations are present.
+            }
+            if (fusee && Contains(bytes, fuseePatch)) result = EmbeddedFsPatchType::Fusee;
+        }
+    }
+    std::fclose(f);
+    return result;
+}
 
 std::vector<CompressedGame> LoadCompressed(const std::string& path) {
     std::vector<CompressedGame> out;
@@ -96,6 +164,13 @@ Sigpatches FindSigpatches(const std::string& sd) {
             }
         }
         std::fclose(f);
+    }
+    if (s.found) return s;
+    // Detect embedded FS patches by code patterns when no external patches are found.
+    const auto embedded = DetectEmbeddedFsPatches(sd);
+    if (embedded != EmbeddedFsPatchType::None) {
+        s.found = true;
+        s.how = embedded == EmbeddedFsPatchType::Mesosphere ? "Embedded - Mesosphere" : "Embedded - Fusee";
     }
     return s;
 }
